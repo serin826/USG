@@ -1,0 +1,92 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MLP(nn.Module):
+    def __init__(self, d_in, d_hidden, d_out, num_layers=3):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            a = d_in if i == 0 else d_hidden
+            b = d_out if i == num_layers - 1 else d_hidden
+            layers.append(nn.Linear(a, b))
+            if i != num_layers - 1:
+                layers.append(nn.ReLU(inplace=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MaskedCrossAttention(nn.Module):
+    """
+    논문 Eq.(6) 형태의 masked cross-attention을 단순화 구현.
+    """
+    def __init__(self, d_model=256, nhead=8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.ln = nn.LayerNorm(d_model)
+
+    def forward(self, q, kv, attn_mask=None):
+        # q: (B,Nq,D), kv: (B,Nk,D)
+        out, _ = self.attn(q, kv, kv, attn_mask=attn_mask, need_weights=False)
+        return self.ln(q + out)
+
+
+class MaskTransformerDecoder(nn.Module):
+    """
+    Mask2Former 스타일: object queries -> 반복적으로 (masked) cross-attn + FFN
+    최종적으로:
+      - mask embedding을 통해 per-pixel feature와 dot-product로 mask 예측
+      - query embedding을 통해 open-vocab 분류
+    """
+    def __init__(self, d_model=256, nhead=8, num_layers=6, num_queries=100):
+        super().__init__()
+        self.num_queries = num_queries
+        self.query_embed = nn.Embedding(num_queries, d_model)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "xca": MaskedCrossAttention(d_model, nhead),
+                "ffn": nn.Sequential(
+                    nn.Linear(d_model, 4 * d_model),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(4 * d_model, d_model),
+                    nn.LayerNorm(d_model),
+                )
+            })
+            for _ in range(num_layers)
+        ])
+
+        self.mask_embed = MLP(d_model, d_model, d_model, num_layers=3)
+
+    def forward(self, ms_feats):
+        """
+        ms_feats: list of multi-scale feature maps, 보통 가장 높은 해상도 feature를 mask 예측에 사용.
+        """
+        B = ms_feats[0].shape[0]
+        q = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # (B,Nq,D)
+
+        # key/value는 가장 낮은 해상도부터 넣는 편이 안정적이라, 마지막 스케일(최저 해상도)을 사용
+        kv_map = ms_feats[-1]
+        kv = kv_map.flatten(2).transpose(1, 2)  # (B,HW,D)
+
+        masks = None
+        for l in self.layers:
+            # (선택) mask 기반 attention mask를 만들 수 있으나, 구현 단순화를 위해 생략 가능
+            q = l["xca"](q, kv, attn_mask=None)
+            q = l["ffn"](q)
+
+            # 중간 mask 예측(학습 시 deep supervision 용)
+            masks = self.predict_masks(q, ms_feats[0])
+
+        return q, masks
+
+    def predict_masks(self, q, high_res_feat):
+        # high_res_feat: (B,D,H,W)
+        B, D, H, W = high_res_feat.shape
+        mask_emb = self.mask_embed(q)  # (B,Nq,D)
+        pix = high_res_feat.flatten(2)  # (B,D,HW)
+        logits = torch.einsum("bnd,bdm->bnm", mask_emb, pix).view(B, -1, H, W)
+        return logits

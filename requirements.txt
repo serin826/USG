@@ -1,0 +1,7 @@
+torch>=2.1
+torchvision>=0.16
+open_clip_torch>=2.24.0
+opencv-python>=4.8
+pyyaml>=6.0
+tqdm>=4.66
+numpy>=1.24

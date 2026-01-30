@@ -1,0 +1,30 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SimpleFPNPixelDecoder(nn.Module):
+    """
+    Mask2Former의 pixel decoder를 '가벼운 FPN'으로 근사.
+    논문은 deformable attention 기반 pixel decoder를 사용하지만,
+    여기서는 구현 난이도를 낮추되 multi-scale feature + 공통 dim 투영은 유지합니다.
+    """
+    def __init__(self, in_channels, out_dim=256):
+        super().__init__()
+        self.proj = nn.ModuleList([nn.Conv2d(c, out_dim, 1) for c in in_channels])
+        self.lateral = nn.ModuleList([nn.Conv2d(out_dim, out_dim, 3, padding=1) for _ in in_channels])
+
+    def forward(self, feats):
+        # feats: [C1..C4], 해상도 낮->높이 순서일 수도 있으니 backbone 출력 순서를 기준으로 통일
+        # 여기서는 feats[0]이 가장 높은 해상도(초기 stage)라고 가정하지 않고,
+        # 일반 ConvNeXt는 stage가 진행될수록 해상도가 내려감. feats[-1]이 최저 해상도.
+        proj = [p(f) for p, f in zip(self.proj, feats)]
+        # top-down FPN
+        out = [None] * len(proj)
+        out[-1] = self.lateral[-1](proj[-1])
+        for i in range(len(proj) - 2, -1, -1):
+            up = F.interpolate(out[i + 1], size=proj[i].shape[-2:], mode="bilinear", align_corners=False)
+            out[i] = self.lateral[i](proj[i] + up)
+
+        # 반환: multi-scale features (논문처럼 3스케일만 쓰고 싶으면 앞쪽 3개 선택)
+        return out  # list of (B,256,Hi,Wi)
