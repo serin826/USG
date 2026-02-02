@@ -125,71 +125,42 @@ class Mask2FormerAdapter(nn.Module):
         )
 
         self._last_query_features: Optional[torch.Tensor] = None
-        self._register_query_feature_hook()
+        self._patch_mask_decoder()
 
-    def _register_query_feature_hook(self):
+    def _patch_mask_decoder(self):
         """
-        Mask2Former 구현체마다 반환 dict에 query embedding이 없을 수 있어서,
-        내부 transformer decoder 출력(hs)을 hook으로 잡아 "마지막 layer의 query feature"를 저장합니다.
+        Mask2Former의 decoder_norm에 hook을 걸어서 query features를 캡처합니다.
+        decoder_norm의 출력이 normalized query features입니다.
+        forward_prediction_heads가 여러 번 호출되므로 마지막 호출의 결과가 저장됩니다.
         """
-        target = None
-        # 흔한 이름들: transformer_decoder / decoder / transformer
-        for name, m in self.mask_decoder.named_modules():
-            lname = name.lower()
-            clsname = m.__class__.__name__.lower()
-            if ("transformer" in lname or "decoder" in lname) and ("decoder" in clsname):
-                # 너무 광범위할 수 있으므로, "layers" 속성 있는 모듈 우선
-                if hasattr(m, "layers"):
-                    target = m
-                    break
+        adapter_self = self
 
-        if target is None:
-            # 최후: mask_decoder 전체에 hook (output에서 추출 시도)
-            target = self.mask_decoder
+        # decoder_norm에 hook 등록 (forward_prediction_heads에서 호출됨)
+        if hasattr(self.mask_decoder, 'decoder_norm'):
+            def hook_fn(module, inp, out):
+                # out: normalized transformer output (Q, B, D)
+                if torch.is_tensor(out) and out.dim() == 3:
+                    # (Q, B, D) -> (B, Q, D)
+                    if out.shape[0] > out.shape[1]:  # Q > B인 경우 (일반적)
+                        adapter_self._last_query_features = out.transpose(0, 1)
+                    else:
+                        adapter_self._last_query_features = out
 
-        def hook_fn(module, inp, out):
-            # out이 tuple/dict/tensor일 수 있음. 가능한 패턴에서 query feature를 뽑아봄.
-            q = None
-            if isinstance(out, dict):
-                # 일부 구현은 pred_embeds 같은 키를 제공
-                for k in ["pred_embeds", "query_features", "hs", "queries"]:
-                    if k in out and torch.is_tensor(out[k]):
-                        q = out[k]
-                        break
-            elif isinstance(out, (tuple, list)):
-                # 흔히 첫 원소가 hs일 수 있음
-                for item in out:
-                    if torch.is_tensor(item):
-                        q = item
-                        break
-            elif torch.is_tensor(out):
-                q = out
+            self.mask_decoder.decoder_norm.register_forward_hook(hook_fn)
+        else:
+            # decoder_norm이 없는 경우: 마지막 FFN layer에 hook
+            if hasattr(self.mask_decoder, 'transformer_ffn_layers'):
+                last_ffn = self.mask_decoder.transformer_ffn_layers[-1]
 
-            if q is None:
-                return
+                def hook_fn(module, inp, out):
+                    if torch.is_tensor(out) and out.dim() == 3:
+                        # (Q, B, D) -> (B, Q, D)
+                        if out.shape[0] > out.shape[1]:
+                            adapter_self._last_query_features = out.transpose(0, 1)
+                        else:
+                            adapter_self._last_query_features = out
 
-            # q shape 정규화:
-            # 가능 형태:
-            #  - (L, B, Q, D)
-            #  - (B, Q, D)
-            #  - (Q, B, D)
-            if q.dim() == 4:
-                # (L,B,Q,D) or (B,L,Q,D) 등
-                if q.shape[0] <= 16:  # L로 가정
-                    q_last = q[-1]
-                else:
-                    q_last = q[:, -1]
-                # q_last: (B,Q,D) 또는 (L,Q,D) 등일 수 있음
-                if q_last.dim() == 3:
-                    self._last_query_features = q_last
-            elif q.dim() == 3:
-                # (B,Q,D) or (Q,B,D)
-                if q.shape[0] < 8 and q.shape[1] > 8:  # (Q,B,D) 같은 경우
-                    self._last_query_features = q.transpose(0, 1)
-                else:
-                    self._last_query_features = q
-
-        target.register_forward_hook(hook_fn)
+                last_ffn.register_forward_hook(hook_fn)
 
     def forward(self, feats_list: List[torch.Tensor]) -> M2FOutputs:
         assert len(feats_list) == len(self.in_features), (

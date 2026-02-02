@@ -16,7 +16,9 @@ import open_clip
 for mask2former_path in [
     '/mnt/d/JSR/scene_graph/USG/Mask2Former',
     '/home/keti/Mask2Former',
+    '/home/keti/dev_sr/USG/Mask2Former',  # Remote server path
     '/home/keti/dev_sr/usg-simple/mask2former',
+    os.path.join(os.path.dirname(__file__), 'Mask2Former'),
     os.path.join(os.path.dirname(__file__), 'mask2former'),
 ]:
     if os.path.exists(mask2former_path) and mask2former_path not in sys.path:
