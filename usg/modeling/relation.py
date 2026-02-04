@@ -75,13 +75,13 @@ class RelationProposalConstructor(nn.Module):
     Steps:
     1. Project queries: S = MLP_s(q), O = MLP_o(q)
     2. Two-way RAC: S, O = RAC(S, O)
-    3. Pair confidence: C[i,j] = cosine_similarity(S[i], O[j])
+    3. Pair confidence: C[i,j] = S[i] · O[j] (scaled dot product, learnable temperature)
     4. Select Top-K pairs
 
     Returns:
         sub_idx, obj_idx: (B, K) selected pair indices
         pair_scores: (B, K) confidence scores for selected pairs
-        pair_conf: (B, Q, Q) full confidence matrix (for L_pair)
+        pair_conf: (B, Q, Q) full confidence matrix (logits, for L_pair)
     """
     def __init__(self, d: int = 256, nhead: int = 8, rac_layers: int = 2, topk: int = 200):
         super().__init__()
@@ -89,6 +89,8 @@ class RelationProposalConstructor(nn.Module):
         self.obj_proj = MLP(d, d, d, num_layers=2)
         self.rac = RelationAwareCrossAttention(d=d, nhead=nhead, num_layers=rac_layers)
         self.topk = topk
+        # Learnable temperature for scaling (initialized to sqrt(d) like attention)
+        self.logit_scale = nn.Parameter(torch.tensor(d ** -0.5))
 
     def forward(self, q: torch.Tensor):
         """
@@ -108,10 +110,10 @@ class RelationProposalConstructor(nn.Module):
         # 2. RAC
         sub, obj = self.rac(sub, obj)
 
-        # 3. Pair confidence matrix (cosine similarity)
-        sub_n = F.normalize(sub, dim=-1)
-        obj_n = F.normalize(obj, dim=-1)
-        C = torch.einsum("bnd,bmd->bnm", sub_n, obj_n)  # (B, Q, Q)
+        # 3. Pair confidence matrix (scaled dot product, NOT cosine similarity)
+        # Use dot product with learnable scale for proper gradient flow
+        scale = self.logit_scale.abs().clamp(min=1e-4)
+        C = torch.einsum("bnd,bmd->bnm", sub, obj) * scale  # (B, Q, Q)
 
         B, Q, _ = C.shape
 
